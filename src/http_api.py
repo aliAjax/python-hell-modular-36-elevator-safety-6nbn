@@ -104,6 +104,14 @@ def create_handler(service, rules, static_dir):
                 if parts == ["api", "offline-records"]:
                     body = self._body()
                     return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                if parts == ["api", "notices"]:
+                    body = self._body()
+                    notice, disposal = service.receive_notice(actor, body)
+                    return self._send(201, {"notice": notice, "disposal": disposal})
+                if len(parts) == 4 and parts[:2] == ["api", "disposals"] and parts[3] in ("claim", "process"):
+                    if parts[3] == "claim":
+                        return self._send(200, service.claim_disposal(actor, parts[2]))
+                    return self._send(200, service.process_disposal(actor, parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

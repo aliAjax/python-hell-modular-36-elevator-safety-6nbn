@@ -199,6 +199,40 @@ class SQLiteRepository:
                 (actor_id, idem_key, entity_id, utcnow()),
             )
 
+    def claim_disposal(self, disposal_id, actor_id):
+        """Atomically claim a disposal record on behalf of an actor.
+
+        The conditional UPDATE is the authority in a race: the first writer
+        commits and advances, the later writer sees the recorded handler.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version, data FROM entities WHERE id = ?", (disposal_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + disposal_id)
+            data = json.loads(row["data"])
+            handler = data.get("handler_id")
+            if handler:
+                raise ConflictError("disposal already claimed by " + str(handler))
+            current_version = int(row["version"])
+            data["handler_id"] = actor_id
+            connection.execute(
+                "UPDATE entities SET data = ?, version = version + 1, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (json.dumps(data, ensure_ascii=False, sort_keys=True), now, disposal_id, current_version),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(disposal_id)
+
     def ping(self):
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()

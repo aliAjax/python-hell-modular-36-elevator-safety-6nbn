@@ -101,15 +101,69 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+def _validate_notice(data, lookup):
+    source_notice_id = str(data.get("source_notice_id", "")).strip()
+    if not source_notice_id:
+        raise ValidationError("source_notice_id is required")
+    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+        raise ValidationError("notice requires equipment")
+    try:
+        revision = int(data.get("revision"))
+    except (TypeError, ValueError):
+        raise ValidationError("revision must be an integer")
+    if revision <= 0:
+        raise ValidationError("revision must be positive")
+
+
+def _active_disposal(equipment_id, lookup):
+    disposals = [
+        d for d in _all(lookup, "disposal")
+        if d["data"].get("equipment_id") == equipment_id and d["status"] == "open"
+    ]
+    if not disposals:
+        return None
+    return max(disposals, key=lambda d: (d["created_at"], d["id"]))
+
+
+def _check_resumption(equipment_id, lookup):
+    """安全联锁：整改关闭、复检合格前不得恢复运行。
+
+    存在生效中的停用通知处置账时，必须具备通知之后的复检合格记录；
+    所有未关闭整改一律拦截恢复运行。复检状态按当前检验记录实时重算，
+    不依赖处置账的缓存。
+    """
+    disposal = _active_disposal(equipment_id, lookup)
+    if disposal:
+        notice = _find_one(lookup, "notice", "id", disposal["data"].get("notice_id"))
+        notice_data = notice["data"] if notice else {}
+        cutoff = notice_data.get("effective_at") or notice_data.get("issued_at") or (notice or {}).get("created_at")
+        reinspected = [
+            i for i in _all(lookup, "inspection")
+            if i["data"].get("equipment_id") == equipment_id
+            and i["status"] == "passed"
+            and str(i["data"].get("scheduled_at", "")) >= str(cutoff)
+        ]
+        if not reinspected:
+            raise ConflictError("return to service requires a passed re-inspection after the notice")
+    for remediation in _all(lookup, "remediation"):
+        if remediation["data"].get("equipment_id") == equipment_id and remediation["status"] != "closed":
+            raise ConflictError("return to service blocked by open remediation")
+
+
+def _return_to_service(actor, entity, data, lookup):
+    _check_resumption(entity["id"], lookup)
+    return {}
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
         raise ConflictError("permit can only be granted for a serviceable equipment")
-    inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
-    if not inspections:
-        raise ConflictError("permit requires a passed inspection")
-    if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
-        raise ConflictError("permit blocked by open remediation")
+    _check_resumption(equipment["id"], lookup)
+    if not _active_disposal(equipment["id"], lookup):
+        inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
+        if not inspections:
+            raise ConflictError("permit requires a passed inspection")
     return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
 
 
@@ -130,12 +184,12 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "notices": "notice", "disposals": "disposal",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "notice": "active", "disposal": "open",
     }
     TRANSITIONS = {
         "equipment": {
@@ -147,6 +201,8 @@ class RuleEngine:
             "pass": (("scheduled",), "passed"),
             "fail": (("scheduled",), "failed"),
             "reschedule": (("failed",), "scheduled"),
+            "withdraw": (("scheduled",), "rescheduled"),
+            "rearrange": (("rescheduled",), "scheduled"),
         },
         "maintenance": {
             "start": (("planned",), "in_progress"),
@@ -172,6 +228,7 @@ class RuleEngine:
         "permit": {
             "request_review": (("blocked",), "pending_review"),
             "grant": (("pending_review",), "granted"),
+            "reconsider": (("granted",), "pending_review"),
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
@@ -184,10 +241,13 @@ class RuleEngine:
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "notice": ("source_notice_id", "equipment_id", "revision"),
+        "disposal": ("notice_id", "equipment_id"),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
         ("inspection", "fail"): ("findings",),
+        ("inspection", "rearrange"): ("scheduled_at",),
         ("maintenance", "complete"): ("completed_at",),
         ("rescue_job", "complete"): ("outcome",),
         ("remediation", "submit_evidence"): ("evidence",),
@@ -202,6 +262,8 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "notice": ("admin",),
+        "disposal": ("admin",),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -210,6 +272,9 @@ class RuleEngine:
         "pass": ("admin", "inspector"),
         "fail": ("admin", "inspector"),
         "reschedule": ("admin", "inspector"),
+        "withdraw": ("admin", "inspector"),
+        "rearrange": ("admin", "inspector"),
+        "reconsider": ("admin", "inspector"),
         "start": ("admin", "maintenance"),
         "complete": ("admin", "maintenance", "dispatcher"),
         "dispatch": ("admin", "dispatcher"),
@@ -234,11 +299,13 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "notice": lambda a, d, l: _validate_notice(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("equipment", "return_to_service"): _return_to_service,
     }
 
     def normalize_kind(self, kind):
