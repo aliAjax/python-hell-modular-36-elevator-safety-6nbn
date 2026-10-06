@@ -101,6 +101,36 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+ACTIVE_NOTICE_STATUSES = ("received", "processing", "applied")
+
+
+def _validate_notice(data, lookup):
+    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+        raise ValidationError("notice requires equipment")
+    notice_no = str(data.get("notice_no", "")).strip()
+    if not notice_no:
+        raise ValidationError("notice_no is required")
+    try:
+        revision = int(data.get("revision"))
+    except (TypeError, ValueError):
+        raise ValidationError("revision must be an integer")
+    if revision <= 0:
+        raise ValidationError("revision must be positive")
+    try:
+        datetime.fromisoformat(str(data.get("issued_at")).replace("Z", "+00:00"))
+    except ValueError:
+        raise ValidationError("issued_at must be ISO-8601")
+    for notice in _all(lookup, "notice"):
+        if (
+            notice["data"].get("notice_no") == notice_no
+            and notice["status"] in ACTIVE_NOTICE_STATUSES
+            and int(notice["data"].get("revision", 0)) >= revision
+        ):
+            raise ConflictError(
+                "stale notice revision: latest is r%s" % notice["data"].get("revision")
+            )
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
@@ -126,16 +156,55 @@ def _complete_rescue(actor, entity, data, lookup):
     return {"resolved_by": actor.user_id}
 
 
+def _claim_notice(actor, entity, data, lookup):
+    claimed_by = entity["data"].get("claimed_by")
+    if claimed_by:
+        raise ConflictError("notice already claimed by " + str(claimed_by))
+    return {
+        "claimed_by": actor.user_id,
+        "claimed_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
+def _guard_return_to_service(actor, entity, data, lookup):
+    notices = [
+        notice
+        for notice in _all(lookup, "notice")
+        if notice["data"].get("equipment_id") == entity["id"]
+        and notice["status"] in ACTIVE_NOTICE_STATUSES
+        and notice["data"].get("effective", True)
+    ]
+    if not notices:
+        return {}
+    if [
+        item
+        for item in _all(lookup, "remediation")
+        if item["data"].get("equipment_id") == entity["id"] and item["status"] != "closed"
+    ]:
+        raise ConflictError("return to service blocked: remediation not closed under active notice")
+    latest = max(notices, key=lambda n: int(n["data"].get("revision", 0)))
+    passed = [
+        item
+        for item in _all(lookup, "inspection")
+        if item["data"].get("equipment_id") == entity["id"]
+        and item["status"] == "passed"
+        and item["created_at"] >= latest["created_at"]
+    ]
+    if not passed:
+        raise ConflictError("return to service blocked: re-inspection not passed under active notice")
+    return {}
+
+
 class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "notices": "notice",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "notice": "received",
     }
     TRANSITIONS = {
         "equipment": {
@@ -146,7 +215,7 @@ class RuleEngine:
         "inspection": {
             "pass": (("scheduled",), "passed"),
             "fail": (("scheduled",), "failed"),
-            "reschedule": (("failed",), "scheduled"),
+            "reschedule": (("failed", "returned"), "scheduled"),
         },
         "maintenance": {
             "start": (("planned",), "in_progress"),
@@ -175,6 +244,12 @@ class RuleEngine:
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
+        "notice": {
+            "claim": (("received", "processing"), "processing"),
+            "apply": (("received", "processing"), "applied"),
+            "supersede": (("received", "processing", "applied"), "superseded"),
+            "withdraw": (("received", "processing", "applied"), "withdrawn"),
+        },
     }
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
@@ -184,6 +259,7 @@ class RuleEngine:
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "notice": ("notice_no", "revision", "equipment_id", "issued_at"),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
@@ -202,6 +278,7 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "notice": ("admin", "inspector"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -225,6 +302,10 @@ class RuleEngine:
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
+        "claim": ("admin", "dispatcher", "inspector"),
+        "apply": ("admin", "dispatcher", "inspector"),
+        "supersede": ("admin", "inspector"),
+        "withdraw": ("admin", "inspector"),
     }
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
@@ -234,11 +315,14 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "notice": lambda a, d, l: _validate_notice(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("notice", "claim"): _claim_notice,
+        ("equipment", "return_to_service"): _guard_return_to_service,
     }
 
     def normalize_kind(self, kind):
